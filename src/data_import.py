@@ -1,15 +1,23 @@
 """Module for downloading Statistics Poland tables."""
 
-from datetime import date, timedelta
+from datetime import date
+from io import BytesIO
+import logging
 from pathlib import Path
 from shutil import move
+import tempfile
 from urllib.parse import urljoin
+from zipfile import is_zipfile
 
 import requests
 from bs4 import BeautifulSoup as bs
 
-RAW_DIR = Path("data/raw")
-BIN_DIR = Path("data/bin")
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DATA_DIR = PROJECT_ROOT / "data"
+RAW_DIR = DATA_DIR / "raw"
+BIN_DIR = DATA_DIR / "bin"
+MAX_PUBLICATION_LOOKBACK_MONTHS = 12
+LOGGER = logging.getLogger(__name__)
 MONTH_NAMES = {
     1: "january",
     2: "february",
@@ -109,7 +117,17 @@ def _download_files(
     for filename, file_url in downloads:
         response = requests.get(urljoin(page_url, file_url), timeout=60)
         response.raise_for_status()
-        (output_dir / f"{filename}{extension}").write_bytes(response.content)
+        if not is_zipfile(BytesIO(response.content)):
+            raise ValueError(
+                f"Downloaded file {filename!r} is not a valid ZIP-based "
+                f"{extension} workbook or archive."
+            )
+        destination = output_dir / f"{filename}{extension}"
+        if destination.exists():
+            raise ValueError(
+                f"Multiple downloads would overwrite {destination.name!r}."
+            )
+        destination.write_bytes(response.content)
 
 
 def _import_bulletin(
@@ -139,18 +157,38 @@ def _fetch_latest_monthly_page(
     repeat_year: bool,
 ) -> tuple[str, bs]:
     publication_date = date.today()
-    page_url = _monthly_page_url(base_url, publication_date, repeat_year)
-    try:
-        soup = _fetch_page(page_url)
-    except requests.exceptions.HTTPError:
-        previous_month = date(
-            publication_date.year,
-            publication_date.month,
-            1,
-        ) - timedelta(days=1)
-        page_url = _monthly_page_url(base_url, previous_month, repeat_year)
-        soup = _fetch_page(page_url)
-    return page_url, soup
+    for _ in range(MAX_PUBLICATION_LOOKBACK_MONTHS):
+        page_url = _monthly_page_url(
+            base_url,
+            publication_date,
+            repeat_year,
+        )
+        try:
+            soup = _fetch_page(page_url)
+        except requests.exceptions.HTTPError as error:
+            if (
+                error.response is None
+                or error.response.status_code != 404
+            ):
+                raise
+            publication_date = _previous_month(publication_date)
+            continue
+        if not _list_downloads(soup, limit=1):
+            raise ValueError(
+                f"Publication page {page_url!r} contains no downloadable "
+                "files."
+            )
+        return page_url, soup
+    raise FileNotFoundError(
+        "No monthly publication page found in the last "
+        f"{MAX_PUBLICATION_LOOKBACK_MONTHS} months for {base_url!r}."
+    )
+
+
+def _previous_month(current_date: date) -> date:
+    if current_date.month == 1:
+        return date(current_date.year - 1, 12, 1)
+    return date(current_date.year, current_date.month - 1, 1)
 
 
 def _import_monthly_publication(
@@ -160,29 +198,44 @@ def _import_monthly_publication(
     output_dir: Path = RAW_DIR,
 ) -> None:
     page_url, soup = _fetch_latest_monthly_page(base_url, repeat_year)
-    _download_files(
-        page_url,
-        _list_downloads(soup, limit=1),
-        extension,
-        output_dir,
-    )
+    downloads = _list_downloads(soup, limit=1)
+    if not downloads:
+        raise ValueError(
+            f"No downloadable publication file found at {page_url!r}."
+        )
+    _download_files(page_url, downloads, extension, output_dir)
 
 
 def importer() -> None:
     """Import data from Statistics Poland."""
-    _move_raw_files_to_bin()
-    _import_bulletin()
-    _import_monthly_publication(
-        BUSINESS_SITUATION_URL,
-        ".zip",
-        repeat_year=True,
-    )
-    _import_monthly_publication(
-        CONSUMER_SITUATION_URL,
-        ".xlsx",
-        repeat_year=False,
-    )
-    print("Data import completed successfully.")
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix=".import-stage-",
+        dir=DATA_DIR,
+    ) as staging_path:
+        staging_dir = Path(staging_path)
+        _import_bulletin(output_dir=staging_dir)
+        _import_monthly_publication(
+            BUSINESS_SITUATION_URL,
+            ".zip",
+            repeat_year=True,
+            output_dir=staging_dir,
+        )
+        _import_monthly_publication(
+            CONSUMER_SITUATION_URL,
+            ".xlsx",
+            repeat_year=False,
+            output_dir=staging_dir,
+        )
+        staged_files = list(staging_dir.iterdir())
+        if not staged_files:
+            raise ValueError("The import produced no files.")
+
+        _move_raw_files_to_bin()
+        RAW_DIR.mkdir(parents=True, exist_ok=True)
+        for staged_file in staged_files:
+            staged_file.replace(RAW_DIR / staged_file.name)
+    LOGGER.info("Data import completed successfully.")
 
 
 if __name__ == "__main__":

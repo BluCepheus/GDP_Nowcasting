@@ -1,11 +1,23 @@
 """Module for unpacking and joining data files."""
 
 import re
+import logging
+import tempfile
 import warnings
 from pathlib import Path
 from zipfile import ZipFile
 from openpyxl import load_workbook
+from openpyxl.worksheet.worksheet import Worksheet
 import pandas as pd
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DATA_RAW_DIR = PROJECT_ROOT / "data" / "raw"
+LOGGER = logging.getLogger(__name__)
+TABLE_PERIOD_PATTERN = re.compile(
+    r"(?P<year>\d{4})\s+(?:(?:M(?P<month>\d{1,2}))|"
+    r"Q(?P<quarter>[1-4])(?:-Q(?P<quarter_end>[1-4]))?)",
+    re.IGNORECASE,
+)
 
 MANUFACTURING_LABELS = {
     "Dobra inwestycyjne Investment goods": "Investment goods",
@@ -186,7 +198,7 @@ def _split_consumer_data(
         else column[:-1]
         for column in df_quarterly.columns
     ]
-    df_quarterly.dropna(inplace=True)
+    df_quarterly.dropna(how="all", inplace=True)
     return df_monthly, df_quarterly
 
 
@@ -269,12 +281,6 @@ def _read_main_indicators_sheet(
     file_path: Path,
     sheet_name: str,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    period_pattern = re.compile(
-        r"(?P<year>\d{4})\s+(?:(?:M(?P<month>\d{1,2}))|"
-        r"Q(?P<quarter>[1-4])(?:-Q(?P<quarter_end>[1-4]))?)",
-        re.IGNORECASE,
-    )
-    periods: list[tuple[int, pd.Timestamp]] = []
     with warnings.catch_warnings():
         warnings.filterwarnings(
             "ignore",
@@ -285,108 +291,20 @@ def _read_main_indicators_sheet(
         workbook = load_workbook(file_path, data_only=True)
     try:
         worksheet = workbook[sheet_name]
-        for row_number, (value,) in enumerate(
-            worksheet.iter_rows(min_col=1, max_col=1, values_only=True),
-            start=1,
-        ):
-            if not isinstance(value, str):
-                continue
-            match = period_pattern.fullmatch(value.strip())
-            if not match:
-                continue
-            year = int(match.group("year"))
-            month = match.group("month")
-            quarter = match.group("quarter")
-            if month is not None:
-                month_number = int(month)
-                if not 1 <= month_number <= 12:
-                    raise ValueError(
-                        f"Invalid month in {value!r} in {file_path.name!r}, "
-                        f"sheet {sheet_name!r}."
-                    )
-                period_date = pd.Timestamp(year, month_number, 1)
-            else:
-                quarter_number = int(match.group("quarter_end") or quarter)
-                period_date = pd.Timestamp(
-                    year,
-                    (quarter_number - 1) * 3 + 1,
-                    1,
-                )
-            periods.append((row_number, period_date))
-
-        if not periods:
-            raise ValueError(
-                f"No supported monthly or quarterly observations found in "
-                f"{file_path.name!r}, sheet {sheet_name!r}."
-            )
-
-        data_start_row = periods[0][0]
-        header_rows = []
-        for row_number in range(1, data_start_row):
-            values = [
-                worksheet.cell(row_number, column).value
-                for column in range(2, worksheet.max_column + 1)
-            ]
-            text_values = [
-                value
-                for value in values
-                if isinstance(value, str) and value.strip()
-            ]
-            if text_values and not any(
-                value.strip().upper().startswith("TABL") for value in text_values
-            ):
-                header_rows.append(row_number)
-        if not header_rows:
-            raise ValueError(
-                f"No column headers found in {file_path.name!r}, "
-                f"sheet {sheet_name!r}."
-            )
-
-        relevant_rows = header_rows + [row for row, _ in periods]
-        last_column = max(
-            (
-                column
-                for row_number in relevant_rows
-                for column in range(2, worksheet.max_column + 1)
-                if worksheet.cell(row_number, column).value is not None
-                and str(worksheet.cell(row_number, column).value).strip()
-            ),
-            default=1,
+        periods = _read_table_periods(worksheet, file_path, sheet_name)
+        header_rows = _find_table_header_rows(
+            worksheet,
+            periods[0][0],
+            file_path,
+            sheet_name,
         )
-        header_values = [
-            [
-                worksheet.cell(row_number, column).value
-                for column in range(2, last_column + 1)
-            ]
-            for row_number in header_rows
-        ]
-        header_row_positions = {
-            row_number: position
-            for position, row_number in enumerate(header_rows)
-        }
-        for merged_range in worksheet.merged_cells.ranges:
-            min_col, min_row, max_col, _ = merged_range.bounds
-            if min_row not in header_row_positions or max_col <= min_col:
-                continue
-            header_row = header_row_positions[min_row]
-            first_column = min_col - 2
-            end_column = min(max_col - 1, last_column - 1)
-            if 0 <= first_column < len(header_values[header_row]):
-                header_values[header_row][first_column:end_column] = [
-                    header_values[header_row][first_column]
-                ] * (end_column - first_column)
-
-        headers = pd.DataFrame(header_values)
-        data = pd.DataFrame(
-            [
-                [
-                    worksheet.cell(row_number, column).value
-                    for column in range(2, last_column + 1)
-                ]
-                for row_number, _ in periods
-            ],
-            index=pd.DatetimeIndex([date for _, date in periods]),
+        last_column = _find_table_last_column(
+            worksheet,
+            header_rows,
+            periods,
         )
+        headers = _read_table_headers(worksheet, header_rows, last_column)
+        data = _read_table_data(worksheet, periods, last_column)
     finally:
         workbook.close()
 
@@ -394,6 +312,153 @@ def _read_main_indicators_sheet(
     data = data.mask(data.eq("*"), pd.NA)
     data = data.replace(r"^\s*$", pd.NA, regex=True)
     return headers, data
+
+
+def _parse_table_period_label(
+    value: object,
+    file_path: Path,
+    sheet_name: str,
+) -> pd.Timestamp | None:
+    if not isinstance(value, str):
+        return None
+    match = TABLE_PERIOD_PATTERN.fullmatch(value.strip())
+    if match is None:
+        return None
+
+    year = int(match.group("year"))
+    month = match.group("month")
+    if month is not None:
+        month_number = int(month)
+        if not 1 <= month_number <= 12:
+            raise ValueError(
+                f"Invalid month in {value!r} in {file_path.name!r}, "
+                f"sheet {sheet_name!r}."
+            )
+        return pd.Timestamp(year, month_number, 1)
+
+    quarter = int(match.group("quarter_end") or match.group("quarter"))
+    return pd.Timestamp(year, (quarter - 1) * 3 + 1, 1)
+
+
+def _read_table_periods(
+    worksheet: Worksheet,
+    file_path: Path,
+    sheet_name: str,
+) -> list[tuple[int, pd.Timestamp]]:
+    periods = []
+    for row_number, (value,) in enumerate(
+        worksheet.iter_rows(min_col=1, max_col=1, values_only=True),
+        start=1,
+    ):
+        period_date = _parse_table_period_label(
+            value,
+            file_path,
+            sheet_name,
+        )
+        if period_date is not None:
+            periods.append((row_number, period_date))
+    if not periods:
+        raise ValueError(
+            f"No supported monthly or quarterly observations found in "
+            f"{file_path.name!r}, sheet {sheet_name!r}."
+        )
+    return periods
+
+
+def _find_table_header_rows(
+    worksheet: Worksheet,
+    data_start_row: int,
+    file_path: Path,
+    sheet_name: str,
+) -> list[int]:
+    header_rows = []
+    for row_number in range(1, data_start_row):
+        values = (
+            worksheet.cell(row_number, column).value
+            for column in range(2, worksheet.max_column + 1)
+        )
+        text_values = [
+            value
+            for value in values
+            if isinstance(value, str) and value.strip()
+        ]
+        has_header_text = any(
+            not value.strip().upper().startswith("TABL")
+            for value in text_values
+        )
+        if has_header_text:
+            header_rows.append(row_number)
+    if not header_rows:
+        raise ValueError(
+            f"No column headers found in {file_path.name!r}, "
+            f"sheet {sheet_name!r}."
+        )
+    return header_rows
+
+
+def _find_table_last_column(
+    worksheet: Worksheet,
+    header_rows: list[int],
+    periods: list[tuple[int, pd.Timestamp]],
+) -> int:
+    relevant_rows = header_rows + [row for row, _ in periods]
+    return max(
+        (
+            column
+            for row_number in relevant_rows
+            for column in range(2, worksheet.max_column + 1)
+            if worksheet.cell(row_number, column).value is not None
+            and str(worksheet.cell(row_number, column).value).strip()
+        ),
+        default=1,
+    )
+
+
+def _read_table_headers(
+    worksheet: Worksheet,
+    header_rows: list[int],
+    last_column: int,
+) -> pd.DataFrame:
+    header_values = [
+        [
+            worksheet.cell(row_number, column).value
+            for column in range(2, last_column + 1)
+        ]
+        for row_number in header_rows
+    ]
+    header_row_positions = {
+        row_number: position
+        for position, row_number in enumerate(header_rows)
+    }
+    for merged_range in worksheet.merged_cells.ranges:
+        min_col, min_row, max_col, _ = merged_range.bounds
+        if min_row not in header_row_positions or max_col <= min_col:
+            continue
+        header_row = header_row_positions[min_row]
+        first_column = min_col - 2
+        end_column = min(max_col - 1, last_column - 1)
+        if 0 <= first_column < len(header_values[header_row]):
+            header_values[header_row][first_column:end_column] = [
+                header_values[header_row][first_column]
+            ] * (end_column - first_column)
+    return pd.DataFrame(header_values)
+
+
+def _read_table_data(
+    worksheet: Worksheet,
+    periods: list[tuple[int, pd.Timestamp]],
+    last_column: int,
+) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            [
+                worksheet.cell(row_number, column).value
+                for column in range(2, last_column + 1)
+            ]
+            for row_number, _ in periods
+        ],
+        index=pd.DatetimeIndex([date for _, date in periods]),
+    )
 
 
 def _quarter_for_consumer_month(
@@ -434,12 +499,19 @@ def _load_quarterly_main_indicators_file(
         month=(target_quarter - 1) * 3 + 1,
         day=1,
     )
-    target_data = data.loc[data.index == target_date]
     is_target_table = file_path.name.startswith("Table 1.")
+    target_column = None
+    if is_target_table:
+        target_column = _main_indicator_column_name(headers, 0)
+        if not target_column:
+            raise ValueError(
+                f"Missing English header for the target column in "
+                f"{file_path.name!r}, sheet {sheet_name!r}."
+            )
+    target_data = data.loc[data.index == target_date]
     if target_data.empty:
         target = None
         if is_target_table:
-            target_column = _main_indicator_column_name(headers, 0)
             target = data.iloc[:, [0]].copy()
             target.columns = [target_column]
         return pd.DataFrame(index=data.index), target
@@ -458,12 +530,6 @@ def _load_quarterly_main_indicators_file(
     selected.columns = columns
     target = None
     if is_target_table:
-        target_column = _main_indicator_column_name(headers, 0)
-        if not target_column:
-            raise ValueError(
-                f"Missing English header for the target column in "
-                f"{file_path.name!r}, sheet {sheet_name!r}."
-            )
         target = data.iloc[:, [0]].copy()
         target.columns = [target_column]
     return selected, target
@@ -682,14 +748,14 @@ def _save_quarterly_files(
     for position, frames in enumerate(quarterly_frames):
         if not frames:
             continue
-        df_quarterly = pd.concat(frames, axis=1, join="outer")
+        df_quarterly = _concat_unique_columns(
+            frames,
+            f"quaterly_data_{position}.xlsx",
+        )
         df_quarterly.index = (
             df_quarterly.index.to_period("Q-DEC").to_timestamp()
         )
         df_quarterly.to_excel(output_dir / f"quaterly_data_{position}.xlsx")
-    obsolete_table_output = output_dir / "quaterly_data_4.xlsx"
-    if obsolete_table_output.exists():
-        obsolete_table_output.unlink()
 
 
 def _save_monthly_files(
@@ -701,18 +767,63 @@ def _save_monthly_files(
         if position > 3:
             continue
         df_monthly = (
-            pd.concat(frames, axis=1, join="outer")
+            _concat_unique_columns(
+                frames,
+                f"monthly_data_{position}.xlsx",
+            )
             if frames
             else pd.DataFrame(index=pd.DatetimeIndex([]))
         )
         if position == 0:
             df_monthly_0 = df_monthly
         df_monthly.to_excel(output_dir / f"monthly_data_{position}.xlsx")
-    for path in output_dir.glob("monthly_data_*.xlsx"):
-        match = re.fullmatch(r"monthly_data_(\d+)\.xlsx", path.name)
-        if match and int(match.group(1)) > 3:
-            path.unlink()
     return df_monthly_0
+
+
+def _concat_unique_columns(
+    frames: list[pd.DataFrame],
+    output_name: str,
+) -> pd.DataFrame:
+    combined = pd.concat(frames, axis=1, join="outer")
+    duplicate_columns = combined.columns[
+        combined.columns.duplicated(keep=False)
+    ].unique()
+    if not duplicate_columns.empty:
+        counts = pd.Series(combined.columns).value_counts()
+        seen: dict[str, int] = {}
+        renamed = []
+        for column in combined.columns:
+            name = str(column)
+            seen[name] = seen.get(name, 0) + 1
+            if counts[name] == 1:
+                renamed.append(name)
+            elif seen[name] == 1:
+                renamed.append(name)
+            else:
+                renamed.append(f"{name}__duplicate_{seen[name]}")
+        combined = combined.copy()
+        combined.columns = renamed
+        LOGGER.warning(
+            "Duplicate column names in %s were disambiguated by suffixing.",
+            output_name,
+        )
+    return combined
+
+
+def _publish_output_files(staging_dir: Path, output_dir: Path) -> None:
+    staged_files = list(staging_dir.glob("*.xlsx"))
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for staged_file in staged_files:
+        staged_file.replace(output_dir / staged_file.name)
+
+    active_names = {path.name for path in staged_files}
+    for pattern in ("monthly_data_*.xlsx", "quaterly_data_*.xlsx"):
+        for output_file in output_dir.glob(pattern):
+            if output_file.name not in active_names:
+                output_file.unlink()
+    target_file = output_dir / "target.xlsx"
+    if target_file.exists() and "target.xlsx" not in active_names:
+        target_file.unlink()
 
 
 def _load_manufacturing_file(file_path: Path) -> list[pd.DataFrame]:
@@ -790,7 +901,13 @@ def _load_services_file(file_path: Path) -> list[pd.DataFrame]:
 
 
 def _clean_services_header(value: object) -> str:
-    lines = [line.strip() for line in str(value).splitlines() if line.strip()]
+    lines = (
+        [line.strip() for line in value.splitlines() if line.strip()]
+        if isinstance(value, str)
+        else []
+    )
+    if not lines:
+        raise ValueError(f"Empty header value: {value!r}.")
     if len(lines) > 1:
         label = lines[-1]
     else:
@@ -973,29 +1090,53 @@ def _load_business_tendency_file(file_path: Path) -> list[pd.DataFrame]:
     return frames
 
 
-def extract_zips(folder_path: str | Path = "data/raw") -> None:
+def extract_zips(folder_path: str | Path = DATA_RAW_DIR) -> None:
     """Extract raw and archived ZIP files into the raw target folder."""
     folder_path = Path(folder_path)
     archive_dir = folder_path.parent / "bin"
-    zip_paths = [
+    found_zips = [
         zip_path
         for source_dir in (folder_path, archive_dir)
         if source_dir.exists()
         for zip_path in source_dir.glob("*.zip")
     ]
+    latest_zips: dict[str, Path] = {}
+    for zip_path in found_zips:
+        group_name = re.sub(
+            r"\s+-\s+[A-Za-z]+\s+\d{4}",
+            "",
+            zip_path.stem,
+            flags=re.IGNORECASE,
+        )
+        current = latest_zips.get(group_name)
+        if current is None or zip_path.stat().st_mtime > current.stat().st_mtime:
+            latest_zips[group_name] = zip_path
 
-    for zip_path in sorted(zip_paths, key=lambda path: path.stat().st_mtime):
+    extracted_from: dict[Path, Path] = {}
+    for zip_path in sorted(
+        latest_zips.values(),
+        key=lambda path: path.stat().st_mtime,
+    ):
         with ZipFile(zip_path, "r") as zip_file:
             for member in zip_file.infolist():
                 if member.is_dir():
                     continue
 
                 target_path = folder_path / Path(member.filename).name
+                previous_source = extracted_from.get(target_path)
+                if previous_source is not None:
+                    LOGGER.warning(
+                        "Archive member collision for %s: %s overwrites %s.",
+                        target_path.name,
+                        zip_path.name,
+                        previous_source.name,
+                    )
 
                 with zip_file.open(member) as source:
                     target_path.write_bytes(source.read())
+                extracted_from[target_path] = zip_path
 
-        print(f"Extracted: {zip_path.name} -> {folder_path}")
+        LOGGER.info("Extracted %s to %s.", zip_path.name, folder_path)
 
 
 def _load_table_workbook(
@@ -1043,58 +1184,96 @@ def _load_table_workbook(
     return target_frame
 
 
-def join_files(folder_path: str | Path = "data/raw"):
+def _append_monthly_business_file(
+    file_path: Path,
+    monthly_frames: dict[int, list[pd.DataFrame]],
+) -> None:
+    loaders = (
+        ("bts-construction", _load_construction_file),
+        ("bts-manufacturing", _load_manufacturing_file),
+        ("bts-services-poland-monthly", _load_services_file),
+        ("bts-services-poland-size", _load_services_size_file),
+        ("bts-trade", _load_trade_file),
+        ("business_tendency_indicators_", _load_business_tendency_file),
+    )
+    for prefix, loader in loaders:
+        if file_path.name.startswith(prefix):
+            monthly_frames[0].extend(loader(file_path))
+            return
+
+
+def _append_input_file(
+    file_path: Path,
+    latest_consumer_month: pd.Timestamp | None,
+    monthly_frames: dict[int, list[pd.DataFrame]],
+    quarterly_frames: list[list[pd.DataFrame]],
+) -> pd.DataFrame | None:
+    if file_path.name.startswith("Consumer"):
+        for loader in (_load_consumer_indicators, _load_consumer_responses):
+            df_monthly, df_quarterly = loader(file_path)
+            monthly_frames[0].append(df_monthly)
+            quarterly_frames[0].append(df_quarterly)
+    elif "additional_questions" in file_path.name:
+        _append_quarterly_frames(
+            _load_additional_questions_file(file_path),
+            quarterly_frames,
+        )
+    elif file_path.name.startswith("Table "):
+        if latest_consumer_month is None:
+            raise ValueError(
+                "A Consumer tendency workbook is required to route Table "
+                f"data from {file_path.name!r}."
+            )
+        return _load_table_workbook(
+            file_path,
+            latest_consumer_month,
+            monthly_frames,
+            quarterly_frames,
+        )
+    else:
+        _append_monthly_business_file(file_path, monthly_frames)
+    return None
+
+
+def join_files(folder_path: str | Path = DATA_RAW_DIR):
     """Join all files into monthly and quarterly data."""
 
     folder_path = Path(folder_path)
     extract_zips(folder_path)
+    file_paths = list(folder_path.glob("*.xlsx"))
     monthly_frames: dict[int, list[pd.DataFrame]] = {0: []}
     quarterly_frames = [[], [], [], []]
     target_frame: pd.DataFrame | None = None
-    latest_consumer_month = None
+    latest_consumer_month = (
+        _get_latest_consumer_month(folder_path)
+        if any(path.name.startswith("Table ") for path in file_paths)
+        else None
+    )
 
-    for file_path in folder_path.glob("*.xlsx"):
-        if file_path.name.startswith("Consumer"):
-            for loader in (_load_consumer_indicators, _load_consumer_responses):
-                df_monthly, df_quarterly = loader(file_path)
-                monthly_frames[0].append(df_monthly)
-                quarterly_frames[0].append(df_quarterly)
-        elif "additional_questions" in file_path.name:
-            _append_quarterly_frames(
-                _load_additional_questions_file(file_path),
-                quarterly_frames,
-            )
-        elif file_path.name.startswith("Table "):
-            if latest_consumer_month is None:
-                latest_consumer_month = _get_latest_consumer_month(folder_path)
-            table_target = _load_table_workbook(
-                file_path,
-                latest_consumer_month,
-                monthly_frames,
-                quarterly_frames,
-            )
-            if table_target is not None:
-                target_frame = table_target
-        elif file_path.name.startswith("bts-construction"):
-            monthly_frames[0].extend(_load_construction_file(file_path))
-        elif file_path.name.startswith("bts-manufacturing"):
-            monthly_frames[0].extend(_load_manufacturing_file(file_path))
-        elif file_path.name.startswith("bts-services-poland-monthly"):
-            monthly_frames[0].extend(_load_services_file(file_path))
-        elif file_path.name.startswith("bts-services-poland-size"):
-            monthly_frames[0].extend(_load_services_size_file(file_path))
-        elif file_path.name.startswith("bts-trade"):
-            monthly_frames[0].extend(_load_trade_file(file_path))
-        elif file_path.name.startswith("business_tendency_indicators_"):
-            monthly_frames[0].extend(_load_business_tendency_file(file_path))
+    for file_path in file_paths:
+        table_target = _append_input_file(
+            file_path,
+            latest_consumer_month,
+            monthly_frames,
+            quarterly_frames,
+        )
+        if table_target is not None:
+            target_frame = table_target
 
     output_dir = folder_path.parent / "interim"
     output_dir.mkdir(parents=True, exist_ok=True)
-    df_monthly_0 = _save_monthly_files(output_dir, monthly_frames)
-    _save_quarterly_files(output_dir, quarterly_frames)
-    if target_frame is not None:
-        target_frame.to_excel(output_dir / "target.xlsx")
+    with tempfile.TemporaryDirectory(
+        prefix=".interim-stage-",
+        dir=output_dir.parent,
+    ) as staging_path:
+        staging_dir = Path(staging_path)
+        df_monthly_0 = _save_monthly_files(staging_dir, monthly_frames)
+        _save_quarterly_files(staging_dir, quarterly_frames)
+        if target_frame is not None:
+            target_frame.to_excel(staging_dir / "target.xlsx")
+        _publish_output_files(staging_dir, output_dir)
 
     return df_monthly_0
 
-join_files()
+if __name__ == "__main__":
+    join_files()
