@@ -1,5 +1,8 @@
 """Regression tests for import safety and data-output integrity."""
 
+# These tests deliberately exercise private ETL helpers at their boundaries.
+# pylint: disable=protected-access
+
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,11 +10,14 @@ from unittest.mock import patch
 
 import pandas as pd
 
-from src import data_import, data_join
+from src import data_import, data_join  # pylint: disable=import-error
 
 
 class ConsumerQuarterlyTests(unittest.TestCase):
+    """Tests for transforming the quarterly consumer series."""
+
     def test_partial_missing_values_do_not_remove_quarter_rows(self) -> None:
+        """Retain quarters with data even when another series is missing."""
         source = pd.DataFrame(
             {
                 "indicator*": [1.0, None, None],
@@ -29,7 +35,10 @@ class ConsumerQuarterlyTests(unittest.TestCase):
 
 
 class OutputIntegrityTests(unittest.TestCase):
+    """Tests for output naming, validation, and stale-file cleanup."""
+
     def test_duplicate_feature_names_are_disambiguated(self) -> None:
+        """Append suffixes rather than emit ambiguous duplicate columns."""
         frames = [
             pd.DataFrame({"duplicate": [1]}),
             pd.DataFrame({"duplicate": [2]}),
@@ -44,10 +53,12 @@ class OutputIntegrityTests(unittest.TestCase):
         )
 
     def test_empty_services_header_raises_value_error(self) -> None:
+        """Reject blank source headers rather than build invalid names."""
         with self.assertRaisesRegex(ValueError, "Empty header"):
             data_join._clean_services_header(None)
 
     def test_publish_removes_stale_managed_outputs(self) -> None:
+        """Remove managed outputs not produced by the successful run."""
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             staging = root / "staging"
@@ -68,7 +79,10 @@ class OutputIntegrityTests(unittest.TestCase):
 
 
 class ImporterReliabilityTests(unittest.TestCase):
+    """Tests for transactional import and publication-page fallback."""
+
     def test_failed_download_stage_does_not_archive_current_raw_files(self) -> None:
+        """Keep current raw files when a staged download fails."""
         with tempfile.TemporaryDirectory() as temporary_directory:
             data_directory = Path(temporary_directory) / "data"
             raw_directory = data_directory / "raw"
@@ -93,13 +107,9 @@ class ImporterReliabilityTests(unittest.TestCase):
             archive.assert_not_called()
 
     def test_monthly_page_fetch_only_falls_back_on_404(self) -> None:
+        """Try the preceding month when the current publication is missing."""
         original_date = data_import.date
-
-        class FixedDate(original_date):
-            @classmethod
-            def today(cls):
-                return cls(2026, 10, 1)
-
+        expected_date = original_date(2026, 10, 1)
         error = data_import.requests.exceptions.HTTPError("not found")
         error.response = type("Response", (), {"status_code": 404})()
         soup = data_import.bs(
@@ -108,9 +118,16 @@ class ImporterReliabilityTests(unittest.TestCase):
             "</span></li></ul>",
             "html.parser",
         )
-        with patch.object(
-            data_import, "_fetch_page", side_effect=[error, soup]
-        ) as fetch, patch.object(data_import, "date", FixedDate):
+        with (
+            patch.object(
+                data_import,
+                "_fetch_page",
+                side_effect=[error, soup],
+            ) as fetch,
+            patch.object(data_import, "date") as date_mock,
+        ):
+            date_mock.today.return_value = expected_date
+            date_mock.side_effect = original_date
             page_url, fetched_soup = data_import._fetch_latest_monthly_page(
                 data_import.BUSINESS_SITUATION_URL,
                 repeat_year=True,
@@ -121,6 +138,7 @@ class ImporterReliabilityTests(unittest.TestCase):
         self.assertEqual(fetch.call_count, 2)
 
     def test_monthly_page_fetch_propagates_non_404_http_errors(self) -> None:
+        """Do not treat server errors as a missing monthly publication."""
         error = data_import.requests.exceptions.HTTPError("server error")
         error.response = type("Response", (), {"status_code": 500})()
         with patch.object(data_import, "_fetch_page", side_effect=error):
